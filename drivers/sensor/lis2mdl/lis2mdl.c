@@ -11,6 +11,7 @@
 #define DT_DRV_COMPAT st_lis2mdl
 
 #include <init.h>
+#if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)
 #include <sys/__assert.h>
 #include <sys/byteorder.h>
 #include <drivers/sensor.h>
@@ -60,9 +61,20 @@ static int lis2mdl_set_hard_iron(struct device *dev, enum sensor_channel chan,
 	u8_t i;
 	union axis3bit16_t offset;
 
-	for (i = 0U; i < 3; i++) {
-		offset.i16bit[i] = sys_cpu_to_le16(val->val1);
-		val++;
+	lis2mdl_mag_user_offset_get(lis2mdl->ctx, offset.u8bit);
+
+	switch (chan) {
+	case SENSOR_CHAN_MAGN_X:
+	case SENSOR_CHAN_MAGN_Y:
+	case SENSOR_CHAN_MAGN_Z:
+		offset.i16bit[chan - SENSOR_CHAN_MAGN_X] = sys_cpu_to_le16(val->val1);
+		break;
+	case SENSOR_CHAN_MAGN_XYZ:
+		for (i = 0U; i < 3; i++) {
+			offset.i16bit[i] = sys_cpu_to_le16(val[i].val1);
+		}
+	default:
+		break; //unreachable
 	}
 
 	return lis2mdl_mag_user_offset_set(lis2mdl->ctx, offset.u8bit);
@@ -132,44 +144,6 @@ static int lis2mdl_channel_get(struct device *dev, enum sensor_channel chan,
 	return 0;
 }
 
-static int lis2mdl_config(struct device *dev, enum sensor_channel chan,
-			    enum sensor_attribute attr,
-			    const struct sensor_value *val)
-{
-	switch (attr) {
-#ifdef CONFIG_LIS2MDL_MAG_ODR_RUNTIME
-	case SENSOR_ATTR_SAMPLING_FREQUENCY:
-		return lis2mdl_set_odr(dev, val);
-#endif /* CONFIG_LIS2MDL_MAG_ODR_RUNTIME */
-	case SENSOR_ATTR_OFFSET:
-		return lis2mdl_set_hard_iron(dev, chan, val);
-	default:
-		LOG_DBG("Mag attribute not supported");
-		return -ENOTSUP;
-	}
-
-	return 0;
-}
-
-static int lis2mdl_attr_set(struct device *dev,
-			      enum sensor_channel chan,
-			      enum sensor_attribute attr,
-			      const struct sensor_value *val)
-{
-	switch (chan) {
-	case SENSOR_CHAN_ALL:
-	case SENSOR_CHAN_MAGN_X:
-	case SENSOR_CHAN_MAGN_Y:
-	case SENSOR_CHAN_MAGN_Z:
-	case SENSOR_CHAN_MAGN_XYZ:
-		return lis2mdl_config(dev, chan, attr, val);
-	default:
-		LOG_DBG("attr_set() not supported on %d channel", chan);
-		return -ENOTSUP;
-	}
-
-	return 0;
-}
 
 static int lis2mdl_sample_fetch_mag(struct device *dev)
 {
@@ -210,21 +184,234 @@ static int lis2mdl_sample_fetch_temp(struct device *dev)
 
 static int lis2mdl_sample_fetch(struct device *dev, enum sensor_channel chan)
 {
+    switch (chan) {
+    case SENSOR_CHAN_MAGN_X:
+    case SENSOR_CHAN_MAGN_Y:
+    case SENSOR_CHAN_MAGN_Z:
+    case SENSOR_CHAN_MAGN_XYZ:
+            lis2mdl_sample_fetch_mag(dev);
+            break;
+    case SENSOR_CHAN_DIE_TEMP:
+            lis2mdl_sample_fetch_temp(dev);
+            break;
+    case SENSOR_CHAN_ALL:
+            lis2mdl_sample_fetch_mag(dev);
+            lis2mdl_sample_fetch_temp(dev);
+            break;
+    default:
+            return -ENOTSUP;
+    }
+
+    return 0;
+}
+
+static int _lis2mdl_wait_and_fetch_data(struct device *dev, int timeout_ms, 
+		union axis3bit16_t *data) {
+	struct lis2mdl_data *lis2mdl = dev->driver_data;
+	int period_us = 1000;
+	int retries = (timeout_ms * 1000) / period_us;
+	uint8_t zyxda;
+	int err;
+
+	while (retries > 0) {
+		err = lis2mdl_mag_data_ready_get(lis2mdl->ctx, &zyxda);
+		if (err < 0) {
+			LOG_ERR("ERR: %d", err);
+			return err;
+		}
+
+		if (zyxda) {
+			err = lis2mdl_magnetic_raw_get(lis2mdl->ctx, data->u8bit);
+			if (err < 0) {
+				LOG_ERR("Failed to read sample");
+				return -EIO;
+			}
+			return 0;
+		}
+        else {
+            retries--;
+		    k_busy_wait(period_us);
+        }
+	}
+
+	LOG_ERR("Timed out fetching data");
+	return -ETIMEDOUT;
+}
+
+static int lis2mdl_calibrate(struct device *dev, enum sensor_channel chan, 
+        const struct sensor_value *val) {
+	int err;
+	union axis3bit16_t raw_mag;
+	int32_t out_sum[3] = {0,0,0};
+    struct sensor_value offsets[3];
+    struct sensor_value *hard_iron = &offsets[0];
+    int sample_count = val->val1;
+
+	// sample
+	LOG_DBG("Sample %d samples for calibration", sample_count);
+	for (int i=0; i<sample_count; i++) {
+		err = _lis2mdl_wait_and_fetch_data(dev, 1000, &raw_mag);
+		if (err < 0) {
+			LOG_ERR("Could not fetch data: %d", err);
+			return err;
+		}
+		for (int j=0; j<3; j++) {
+			out_sum[j] += sys_le16_to_cpu(raw_mag.i16bit[j]);
+		}
+	}
+
+    for (int i=0; i < ARRAY_SIZE(offsets); i++) {
+        offsets[i].val1 = out_sum[i] / sample_count;
+    }
+
+    if (chan != SENSOR_CHAN_MAGN_XYZ) {
+        hard_iron = &offsets[chan - SENSOR_CHAN_MAGN_X];
+    }
+    
+    return lis2mdl_set_hard_iron(dev, chan, offsets);
+}
+
+#if CONFIG_LIS2MDL_SELF_TEST
+static int lis2mdl_self_test(struct device *dev) {
+	struct lis2mdl_data *lis2mdl = dev->driver_data;
+	int err;
+	union axis3bit16_t raw_mag;
+	int32_t out_nost[3] = {0,0,0};
+	int32_t out_st[3] = {0,0,0};
+	int success;
+
+	LOG_DBG("Starting selftest");
+	//Init, turn_on, bfu, continuous, offset_canc, odr_100
+	uint8_t cfg_val[3] = {0x8C, 0x02, 0x10};
+	err = lis2mdl_write_reg(lis2mdl->ctx, LIS2MDL_CFG_REG_A, cfg_val, 3);
+	if (err < 0) {
+		LOG_ERR("ERR: %d", err);
+		return err;
+	}
+
+	// wait for stable output
+	LOG_DBG("Waiting for stable output");
+	k_msleep(20);
+	err = _lis2mdl_wait_and_fetch_data(dev, 1000, &raw_mag);
+	if (err < 0) {
+		LOG_ERR("Could not fetch data: %d", err);
+		return err;
+	}
+
+	// sample before self test
+	LOG_DBG("Sample before self test");
+	for (int i=0; i<50; i++) {
+		err = _lis2mdl_wait_and_fetch_data(dev, 1000, &raw_mag);
+		if (err < 0) {
+			LOG_ERR("Could not fetch data: %d", err);
+			return err;
+		}
+		for (int j=0; j<3; j++) {
+			out_nost[j] += sys_le16_to_cpu(raw_mag.i16bit[j]);
+		}
+	}
+
+	// enable self test
+	LOG_DBG("Enable self test");
+	err = lis2mdl_self_test_set(lis2mdl->ctx, PROPERTY_ENABLE);
+	if (err < 0) {
+		LOG_ERR("ERR: %d", err);
+		return err;
+	}
+
+	// wait for stable output
+	LOG_DBG("Waiting for stable output");
+	k_msleep(60);
+	err = _lis2mdl_wait_and_fetch_data(dev, 1000, &raw_mag);
+	if (err < 0) {
+		LOG_ERR("Could not fetch data: %d", err);
+		return err;
+	}
+
+	// sample self test
+	LOG_DBG("Sample after self test");
+	for (int i=0; i<50; i++) {
+		err = _lis2mdl_wait_and_fetch_data(dev, 1000, &raw_mag);
+		if (err < 0) {
+			LOG_ERR("Could not fetch data: %d", err);
+			return err;
+		}
+		for (int j=0; j<3; j++) {
+			out_st[j] += sys_le16_to_cpu(raw_mag.i16bit[j]);
+		}
+	}
+
+	// test
+	LOG_DBG("Check test results");
+	success = 0;
+	for (int j=0; j<3; j++) {
+		//TODO multiply by 1500?
+		int32_t diff = out_st[j] - out_nost[j];
+		diff = (diff < 0) ? -diff : diff;
+		LOG_DBG("ST: %d, NOST: %d, DIFF: %d", out_st[j], out_nost[j], diff);
+		if (diff <= 15*50 || diff >= 500*50) {
+			success = 1; //FAIL
+		}
+	}
+
+	// end test
+	LOG_DBG("Stop self test");
+	err = lis2mdl_self_test_set(lis2mdl->ctx, PROPERTY_DISABLE);
+	if (err < 0) {
+		LOG_ERR("ERR: %d", err);
+		return err;
+	}
+
+	// idle mode
+	LOG_DBG("Set mode to idle");
+	cfg_val[0] = 0x83;
+	err = lis2mdl_write_reg(lis2mdl->ctx, LIS2MDL_CFG_REG_A, cfg_val, 1);
+	if (err < 0) {
+		LOG_ERR("ERR: %d", err);
+		return err;
+	}
+
+	LOG_DBG("Self test %s", (success==0) ? "was successful" : "failed");
+    return 0;
+	return success;
+}
+#endif
+
+static int lis2mdl_config(struct device *dev, enum sensor_channel chan,
+			    enum sensor_attribute attr,
+			    const struct sensor_value *val)
+{
+	switch (attr) {
+#ifdef CONFIG_LIS2MDL_MAG_ODR_RUNTIME
+	case SENSOR_ATTR_SAMPLING_FREQUENCY:
+		return lis2mdl_set_odr(dev, val);
+#endif /* CONFIG_LIS2MDL_MAG_ODR_RUNTIME */
+	case SENSOR_ATTR_OFFSET:
+		return lis2mdl_set_hard_iron(dev, chan, val);
+    case SENSOR_ATTR_CALIB_TARGET:
+        return lis2mdl_calibrate(dev, chan, val);
+	default:
+		LOG_DBG("Mag attribute not supported");
+		return -ENOTSUP;
+	}
+
+	return 0;
+}
+
+static int lis2mdl_attr_set(struct device *dev,
+			      enum sensor_channel chan,
+			      enum sensor_attribute attr,
+			      const struct sensor_value *val)
+{
 	switch (chan) {
+	case SENSOR_CHAN_ALL:
 	case SENSOR_CHAN_MAGN_X:
 	case SENSOR_CHAN_MAGN_Y:
 	case SENSOR_CHAN_MAGN_Z:
 	case SENSOR_CHAN_MAGN_XYZ:
-		lis2mdl_sample_fetch_mag(dev);
-		break;
-	case SENSOR_CHAN_DIE_TEMP:
-		lis2mdl_sample_fetch_temp(dev);
-		break;
-	case SENSOR_CHAN_ALL:
-		lis2mdl_sample_fetch_mag(dev);
-		lis2mdl_sample_fetch_temp(dev);
-		break;
+		return lis2mdl_config(dev, chan, attr, val);
 	default:
+		LOG_DBG("attr_set() not supported on %d channel", chan);
 		return -ENOTSUP;
 	}
 
@@ -304,6 +491,12 @@ static int lis2mdl_init(struct device *dev)
 		LOG_DBG("Invalid chip ID: %02x\n", wai);
 		return -EINVAL;
 	}
+#if CONFIG_LIS2MDL_SELF_TEST
+	if (lis2mdl_self_test(dev) != 0) {
+		LOG_DBG("Self test failed");
+		return -1; //TODO
+	}
+#endif
 
 	/* reset sensor configuration */
 	if (lis2mdl_reset_set(lis2mdl->ctx, PROPERTY_ENABLE) < 0) {
@@ -334,7 +527,8 @@ static int lis2mdl_init(struct device *dev)
 
 	/* Set / Reset sensor mode */
 	if (lis2mdl_set_rst_mode_set(lis2mdl->ctx,
-				     LIS2MDL_SENS_OFF_CANC_EVERY_ODR)) {
+				     //LIS2MDL_SENS_OFF_CANC_EVERY_ODR)) {
+				     LIS2MDL_SET_SENS_ODR_DIV_63)) {
 		LOG_DBG("reset sensor mode failed\n");
 		return -EIO;
 	}
@@ -358,9 +552,14 @@ static int lis2mdl_init(struct device *dev)
 	}
 #endif
 
+	LOG_DBG("Done init");
 	return 0;
 }
 
 DEVICE_AND_API_INIT(lis2mdl, DT_INST_LABEL(0), lis2mdl_init,
 		     &lis2mdl_data, &lis2mdl_dev_config, POST_KERNEL,
 		     CONFIG_SENSOR_INIT_PRIORITY, &lis2mdl_driver_api);
+
+#else
+#warning "LIS2MDL driver enabled without any devices"
+#endif

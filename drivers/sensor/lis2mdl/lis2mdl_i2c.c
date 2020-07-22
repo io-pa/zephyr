@@ -26,9 +26,17 @@ static int lis2mdl_i2c_read(struct device *dev, u8_t reg_addr,
 {
 	struct lis2mdl_data *data = dev->driver_data;
 	const struct lis2mdl_config *cfg = dev->config_info;
+	
+	int err = 0;
 
-	return i2c_burst_read(data->bus, cfg->i2c_slv_addr,
-			      reg_addr, value, len);
+	for (int i=0; i<len && err >= 0; i++) {
+		err = i2c_reg_read_byte(data->bus, cfg->i2c_slv_addr, 
+					reg_addr+i, &value[i]);
+        if (err) {
+            return err;
+        }
+	}
+	return err;
 }
 
 static int lis2mdl_i2c_write(struct device *dev, u8_t reg_addr,
@@ -37,8 +45,15 @@ static int lis2mdl_i2c_write(struct device *dev, u8_t reg_addr,
 	struct lis2mdl_data *data = dev->driver_data;
 	const struct lis2mdl_config *cfg = dev->config_info;
 
-	return i2c_burst_write(data->bus, cfg->i2c_slv_addr,
-			       reg_addr, value, len);
+	int err = 0;
+	for (int i=0; i<len && err >= 0; i++) {
+		err = i2c_reg_write_byte(data->bus, cfg->i2c_slv_addr,
+					reg_addr+i, value[i]);
+        if (err) {
+            return err;
+        }
+	}
+	return err;
 }
 
 int lis2mdl_i2c_init(struct device *dev)

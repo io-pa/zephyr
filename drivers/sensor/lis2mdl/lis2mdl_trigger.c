@@ -35,15 +35,22 @@ int lis2mdl_trigger_set(struct device *dev,
 	union axis3bit16_t raw;
 
 	if (trig->chan == SENSOR_CHAN_MAGN_XYZ) {
-		lis2mdl->handler_drdy = handler;
-		if (handler) {
-			/* fetch raw data sample: re-trigger lost interrupt */
-			lis2mdl_magnetic_raw_get(lis2mdl->ctx, raw.u8bit);
+        switch (trig->type) {
+            case SENSOR_TRIG_DATA_READY:
+                lis2mdl->handler_drdy = handler;
+                if (handler) {
+                    /* fetch raw data sample: re-trigger lost interrupt */
+                    lis2mdl_magnetic_raw_get(lis2mdl->ctx, raw.u8bit);
 
-			return lis2mdl_enable_int(dev, 1);
-		} else {
-			return lis2mdl_enable_int(dev, 0);
-		}
+                    return lis2mdl_enable_int(dev, 1);
+                } else {
+                    return lis2mdl_enable_int(dev, 0);
+                }
+            case SENSOR_TRIG_THRESHOLD:
+                break; //TODO
+            default: 
+                break;
+        }
 	}
 
 	return -ENOTSUP;

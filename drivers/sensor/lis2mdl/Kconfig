@@ -35,6 +35,9 @@ endchoice # LIS2MDL_TRIGGER_MODE
 config LIS2MDL_TRIGGER
 	bool
 
+config LIS2MDL_SELF_TEST
+    bool "Execute self test at start"
+
 config LIS2MDL_THREAD_PRIORITY
 	int "Thread priority"
 	depends on LIS2MDL_TRIGGER_OWN_THREAD
