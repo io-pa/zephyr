@@ -137,7 +137,10 @@ static void timeout_handler(struct k_timer *timer)
 static void cal_hf_on_callback(struct device *dev,
 				clock_control_subsys_t subsys, void *user_data)
 {
-	if ((temp_sensor == NULL) || !IS_ENABLED(CONFIG_MULTITHREADING)) {
+	if ((temp_sensor == NULL) || !IS_ENABLED(CONFIG_MULTITHREADING)
+		|| k_is_pre_kernel()
+		|| k_sys_work_q.thread.base.thread_state == 0
+	) {
 		start_hw_cal();
 	} else {
 		k_work_submit(&temp_measure_work);
